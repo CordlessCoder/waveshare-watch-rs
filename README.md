@@ -521,3 +521,14 @@ Source files under an open license (to be specified). Drivers inspired by Wavesh
 - AXP2101 datasheet: X-Powers
 - ES8311 datasheet: Everest Semiconductor
 - QMI8658 datasheet: QST Corporation
+
+
+## Star History
+
+<a href="https://www.star-history.com/?repos=infinition%2Fwaveshare-watch-rs&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=infinition/waveshare-watch-rs&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=infinition/waveshare-watch-rs&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=infinition/waveshare-watch-rs&type=date&legend=top-left" />
+ </picture>
+</a>
