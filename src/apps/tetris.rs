@@ -197,7 +197,7 @@ impl App for TetrisGame {
         }
 
         // Gyroscope tilt: move piece left/right
-        let (ax, ay, _) = input.accel;
+        let (_ax, ay, _) = input.accel;
         self.gyro_timer += input.dt_ms;
         if self.gyro_timer >= GYRO_MOVE_MS {
             self.gyro_timer -= GYRO_MOVE_MS;

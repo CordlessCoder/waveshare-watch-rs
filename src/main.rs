@@ -3,17 +3,17 @@
 
 extern crate alloc;
 
+mod apps;
 mod board;
 mod drivers;
 mod peripherals;
 mod ui;
-mod apps;
 
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefCell;
+use esp_radio::wifi::sta::StationConfig;
 
-use embedded_graphics_core::prelude::RawData;
 use embedded_hal_bus::i2c::RefCellDevice;
 use esp_alloc as _;
 use esp_backtrace as _;
@@ -27,7 +27,7 @@ use esp_hal::delay::Delay;
 use esp_hal::dma::{DmaRxBuf, DmaTxBuf};
 use esp_hal::dma_buffers;
 // use esp_hal::i2s::master::{I2s, Config as I2sConfig, DataFormat}; // TODO: wire I2S
-use esp_hal::gpio::{InputConfig, Level, Output, OutputConfig, Pull, Input};
+use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
 use esp_hal::i2c::master::{Config as I2cConfig, I2c};
 use esp_hal::interrupt::software::SoftwareInterruptControl;
 use esp_hal::spi::master::{Config as SpiConfig, Spi};
@@ -36,30 +36,32 @@ use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
 use esp_println::println;
 
+use crate::apps::flappy::FlappyGame;
+use crate::apps::game2048::Game2048;
+use crate::apps::maze::MazeGame;
+use crate::apps::mp3player::Mp3Player;
+use crate::apps::settings::SettingsApp;
+use crate::apps::smarthome::SmartHomeApp;
+use crate::apps::snake::SnakeGame;
+use crate::apps::tetris::TetrisGame;
+use crate::apps::{App, AppInput, AppResult, AppState};
 use crate::drivers::co5300::Co5300Display;
 use crate::drivers::framebuffer::Framebuffer;
 use crate::drivers::qspi_bus::QspiBus;
-use crate::peripherals::power::Axp2101Power;
-use crate::peripherals::touch::{Ft3168Touch, SwipeDirection};
-use crate::peripherals::rtc::{Pcf85063aRtc, DateTime};
+use crate::peripherals::audio::{fill_beep_buffer, Es8311};
 use crate::peripherals::imu::Qmi8658Imu;
-use crate::ui::watchface::WatchFace;
-use crate::ui::pages::{self, Page};
-use crate::apps::{App, AppInput, AppResult, AppState};
-use crate::apps::snake::SnakeGame;
-use crate::apps::game2048::Game2048;
-use crate::apps::tetris::TetrisGame;
-use crate::apps::flappy::FlappyGame;
-use crate::apps::maze::MazeGame;
+use crate::peripherals::power::Axp2101Power;
+use crate::peripherals::rtc::Pcf85063aRtc;
+use crate::peripherals::touch::{Ft3168Touch, SwipeDirection};
 use crate::ui::launcher::Launcher;
-use crate::apps::settings::SettingsApp;
-use crate::apps::mp3player::Mp3Player;
-use crate::apps::smarthome::SmartHomeApp;
-use crate::peripherals::audio::{Es8311, fill_beep_buffer};
+use crate::ui::pages::{self, Page};
+use crate::ui::watchface::WatchFace;
 
 // Network runner task (must be spawned for WiFi to work)
 #[embassy_executor::task]
-async fn net_task(mut runner: embassy_net::Runner<'static, esp_radio::wifi::WifiDevice<'static>>) -> ! {
+async fn net_task(
+    mut runner: embassy_net::Runner<'static, esp_radio::wifi::Interface<'static>>,
+) -> ! {
     runner.run().await
 }
 
@@ -68,7 +70,7 @@ async fn ntp_sync(
     stack: embassy_net::Stack<'static>,
     rtc: &mut crate::peripherals::rtc::Pcf85063aRtc<impl embedded_hal::i2c::I2c>,
 ) -> Result<(), ()> {
-    use embassy_net::udp::{UdpSocket, PacketMetadata};
+    use embassy_net::udp::{PacketMetadata, UdpSocket};
 
     let mut rx_meta = [PacketMetadata::EMPTY; 1];
     let mut rx_buf = [0u8; 256];
@@ -84,17 +86,19 @@ async fn ntp_sync(
 
     // Resolve pool.ntp.org (use Google's NTP IP directly: 216.239.35.0)
     let ntp_addr = embassy_net::Ipv4Address::new(216, 239, 35, 0);
-    socket.send_to(&ntp_request, (ntp_addr, 123)).await.map_err(|_| ())?;
+    socket
+        .send_to(&ntp_request, (ntp_addr, 123))
+        .await
+        .map_err(|_| ())?;
 
     // Wait for response (timeout 5s)
     let mut response = [0u8; 48];
-    match embassy_time::with_timeout(
-        Duration::from_secs(5),
-        socket.recv_from(&mut response),
-    ).await {
+    match embassy_time::with_timeout(Duration::from_secs(5), socket.recv_from(&mut response)).await
+    {
         Ok(Ok((len, _addr))) if len >= 48 => {
             // Parse NTP timestamp (bytes 40-43 = seconds since 1900-01-01)
-            let ntp_secs = u32::from_be_bytes([response[40], response[41], response[42], response[43]]);
+            let ntp_secs =
+                u32::from_be_bytes([response[40], response[41], response[42], response[43]]);
             // Convert NTP epoch (1900) to Unix epoch (1970): subtract 70 years in seconds
             let unix_secs = ntp_secs.wrapping_sub(2_208_988_800);
             // Convert to hours/minutes/seconds (UTC+2 for France)
@@ -110,12 +114,19 @@ async fn ntp_sync(
             // Simple date from days since 1970-01-01
             let (year, month, day) = days_to_date(total_days);
 
-            println!("[NTP] Time: {:02}:{:02}:{:02} {:02}/{:02}/{}", hours, minutes, seconds, day, month, year);
+            println!(
+                "[NTP] Time: {:02}:{:02}:{:02} {:02}/{:02}/{}",
+                hours, minutes, seconds, day, month, year
+            );
 
             // Set RTC
             let dt = crate::peripherals::rtc::DateTime::new(
-                (year - 2000) as u8, month as u8, day as u8,
-                hours, minutes, seconds,
+                (year - 2000) as u8,
+                month as u8,
+                day as u8,
+                hours,
+                minutes,
+                seconds,
             );
             let _ = rtc.set_time(&dt);
             Ok(())
@@ -129,13 +140,32 @@ fn days_to_date(days_since_epoch: i32) -> (u32, u32, u32) {
     let mut y = 1970i32;
     let mut remaining = days_since_epoch;
     loop {
-        let days_in_year = if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) { 366 } else { 365 };
-        if remaining < days_in_year { break; }
+        let days_in_year = if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) {
+            366
+        } else {
+            365
+        };
+        if remaining < days_in_year {
+            break;
+        }
         remaining -= days_in_year;
         y += 1;
     }
     let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
-    let month_days = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let month_days = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
     let mut m = 0;
     while m < 12 && remaining >= month_days[m] {
         remaining -= month_days[m];
@@ -154,17 +184,17 @@ async fn main(_spawner: Spawner) {
     // Power-aware: default to 160MHz instead of 240MHz.
     // Saves ~30% CPU power without noticeable impact on UI/sensor work.
     // Game code can still trigger short bursts via DMA/peripherals at 80MHz QSPI which is unchanged.
-    let peripherals = esp_hal::init(
-        esp_hal::Config::default()
-            .with_cpu_clock(esp_hal::clock::CpuClock::_160MHz)
-    );
+    let peripherals =
+        esp_hal::init(esp_hal::Config::default().with_cpu_clock(esp_hal::clock::CpuClock::_160MHz));
+    let sw_int = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
 
     // PSRAM
     esp_alloc::psram_allocator!(peripherals.PSRAM, esp_hal::psram);
 
     // Embassy timer
     let timg0 = TimerGroup::new(peripherals.TIMG0);
-    esp_rtos::start(timg0.timer0);
+
+    esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
 
     esp_println::logger::init_logger_from_env();
     println!("=== Waveshare Watch RS v0.4 (Embassy) ===");
@@ -223,8 +253,14 @@ async fn main(_spawner: Spawner) {
     let mut touch_rst = Output::new(peripherals.GPIO9, Level::High, OutputConfig::default());
     // GPIO38 is the FT3168 INT line: held high by pull-up, pulled low by the controller
     // when a finger is on the screen. We use it both for level checks and as an async wake source.
-    let mut touch_int = Input::new(peripherals.GPIO38, InputConfig::default().with_pull(Pull::Up));
-    touch_rst.set_low(); delay.delay_millis(10); touch_rst.set_high(); delay.delay_millis(50);
+    let mut touch_int = Input::new(
+        peripherals.GPIO38,
+        InputConfig::default().with_pull(Pull::Up),
+    );
+    touch_rst.set_low();
+    delay.delay_millis(10);
+    touch_rst.set_high();
+    delay.delay_millis(50);
     let mut touch = Ft3168Touch::new(RefCellDevice::new(&i2c_ref));
     let _ = touch.init();
     println!("[TOUCH] OK");
@@ -253,7 +289,7 @@ async fn main(_spawner: Spawner) {
 
     use embedded_hal_bus::spi::ExclusiveDevice;
     let sd_spi_dev = ExclusiveDevice::new_no_delay(sd_spi, sd_cs).unwrap();
-    let mut sd_card = embedded_sdmmc::SdCard::new(sd_spi_dev, delay);
+    let sd_card = embedded_sdmmc::SdCard::new(sd_spi_dev, delay);
     let mut sd_ok = false;
     let mut mp3_files: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
     match sd_card.num_bytes() {
@@ -268,32 +304,18 @@ async fn main(_spawner: Spawner) {
                 }
             }
 
-            let mut volume_mgr = embedded_sdmmc::VolumeManager::new(sd_card, DummyTime);
+            let volume_mgr = embedded_sdmmc::VolumeManager::new(sd_card, DummyTime);
             match volume_mgr.open_raw_volume(embedded_sdmmc::VolumeIdx(0)) {
-            Ok(volume) => {
-                if let Ok(root_dir) = volume_mgr.open_root_dir(volume) {
-                    if let Ok(mp3_dir) = volume_mgr.open_dir(root_dir, "MP3") {
-                        println!("[SD] Found /MP3/ folder");
-                        let _ = volume_mgr.iterate_dir(mp3_dir, |entry| {
-                            if !entry.attributes.is_directory() {
-                                let name = core::str::from_utf8(&entry.name.base_name()).unwrap_or("?");
-                                let ext = core::str::from_utf8(&entry.name.extension()).unwrap_or("");
-                                let full = alloc::format!("{}.{}", name.trim(), ext.trim());
-                                println!("[SD]   {}", full);
-                                mp3_files.push(full);
-                            }
-                        });
-                        println!("[SD] {} files found", mp3_files.len());
-                        let _ = volume_mgr.close_dir(mp3_dir);
-                        sd_ok = true;
-                    } else {
-                        // Try lowercase
-                        if let Ok(mp3_dir) = volume_mgr.open_dir(root_dir, "mp3") {
-                            println!("[SD] Found /mp3/ folder");
+                Ok(volume) => {
+                    if let Ok(root_dir) = volume_mgr.open_root_dir(volume) {
+                        if let Ok(mp3_dir) = volume_mgr.open_dir(root_dir, "MP3") {
+                            println!("[SD] Found /MP3/ folder");
                             let _ = volume_mgr.iterate_dir(mp3_dir, |entry| {
                                 if !entry.attributes.is_directory() {
-                                    let name = core::str::from_utf8(&entry.name.base_name()).unwrap_or("?");
-                                    let ext = core::str::from_utf8(&entry.name.extension()).unwrap_or("");
+                                    let name = core::str::from_utf8(&entry.name.base_name())
+                                        .unwrap_or("?");
+                                    let ext =
+                                        core::str::from_utf8(&entry.name.extension()).unwrap_or("");
                                     let full = alloc::format!("{}.{}", name.trim(), ext.trim());
                                     println!("[SD]   {}", full);
                                     mp3_files.push(full);
@@ -303,17 +325,35 @@ async fn main(_spawner: Spawner) {
                             let _ = volume_mgr.close_dir(mp3_dir);
                             sd_ok = true;
                         } else {
-                            println!("[SD] No /mp3/ or /MP3/ folder");
+                            // Try lowercase
+                            if let Ok(mp3_dir) = volume_mgr.open_dir(root_dir, "mp3") {
+                                println!("[SD] Found /mp3/ folder");
+                                let _ = volume_mgr.iterate_dir(mp3_dir, |entry| {
+                                    if !entry.attributes.is_directory() {
+                                        let name = core::str::from_utf8(&entry.name.base_name())
+                                            .unwrap_or("?");
+                                        let ext = core::str::from_utf8(&entry.name.extension())
+                                            .unwrap_or("");
+                                        let full = alloc::format!("{}.{}", name.trim(), ext.trim());
+                                        println!("[SD]   {}", full);
+                                        mp3_files.push(full);
+                                    }
+                                });
+                                println!("[SD] {} files found", mp3_files.len());
+                                let _ = volume_mgr.close_dir(mp3_dir);
+                                sd_ok = true;
+                            } else {
+                                println!("[SD] No /mp3/ or /MP3/ folder");
+                            }
                         }
+                        let _ = volume_mgr.close_dir(root_dir);
+                    } else {
+                        println!("[SD] Can't open root dir");
                     }
-                    let _ = volume_mgr.close_dir(root_dir);
-                } else {
-                    println!("[SD] Can't open root dir");
                 }
-            }
-            Err(e) => {
-                println!("[SD] Can't open volume: {:?}", e);
-            }
+                Err(e) => {
+                    println!("[SD] Can't open volume: {:?}", e);
+                }
             }
         }
         Err(_) => println!("[SD] No card"),
@@ -338,8 +378,8 @@ async fn main(_spawner: Spawner) {
 
     // === I2S Audio Output (using public write_dma) ===
     println!("[AUDIO] Init I2S...");
-    use esp_hal::i2s::master::{I2s, Config as I2sConfig, DataFormat};
     use esp_hal::dma::DmaDescriptor;
+    use esp_hal::i2s::master::{Config as I2sConfig, DataFormat, I2s};
     let i2s_config = I2sConfig::default()
         .with_sample_rate(Rate::from_hz(16000))
         .with_data_format(DataFormat::Data16Channel16);
@@ -347,7 +387,8 @@ async fn main(_spawner: Spawner) {
         .expect("I2S failed")
         .with_mclk(peripherals.GPIO16);
     static mut I2S_TX_DESC: [DmaDescriptor; 8] = [DmaDescriptor::EMPTY; 8];
-    let mut i2s_tx = i2s_periph.i2s_tx
+    let mut i2s_tx = i2s_periph
+        .i2s_tx
         .with_bclk(peripherals.GPIO41)
         .with_ws(peripherals.GPIO45)
         .with_dout(peripherals.GPIO40)
@@ -360,46 +401,43 @@ async fn main(_spawner: Spawner) {
 
     // === WiFi init (esp-radio) ===
     println!("[WIFI] Init radio...");
-    static RADIO: StaticCell<esp_radio::Controller<'static>> = StaticCell::new();
-    let radio_controller = RADIO.init(esp_radio::init().expect("esp-radio init failed"));
-    let wifi_config = esp_radio::wifi::Config::default();
-    let (mut wifi_controller, wifi_interfaces) = esp_radio::wifi::new(
-        radio_controller,
-        peripherals.WIFI,
-        wifi_config,
-    ).expect("WiFi init failed");
+    let wifi_config = esp_radio::wifi::ControllerConfig::default();
+    let (mut wifi_controller, wifi_interfaces) =
+        esp_radio::wifi::new(peripherals.WIFI, wifi_config).expect("WiFi init failed");
 
     // Configure STA mode — set your WiFi credentials here before building.
-    use esp_radio::wifi::{ModeConfig, ClientConfig, AuthMethod};
-    let client_config = ClientConfig::default()
-        .with_ssid(alloc::string::String::from(env!("WIFI_SSID")))
-        .with_password(alloc::string::String::from(env!("WIFI_PASS")))
-        .with_auth_method(AuthMethod::WpaWpa2Personal);
-    let mode_config = ModeConfig::Client(client_config);
-    wifi_controller.set_config(&mode_config).expect("WiFi config failed");
-    wifi_controller.start().expect("WiFi start failed");
+    use esp_radio::wifi::Config;
+    let client_config = Config::Station(
+        StationConfig::default()
+            .with_ssid(env!("WIFI_SSID"))
+            .with_password(alloc::string::String::from(env!("WIFI_PASS")))
+            .with_auth_method(esp_radio::wifi::AuthenticationMethod::Wpa2Wpa3Personal),
+    );
+    wifi_controller
+        .set_config(&client_config)
+        .expect("WiFi config failed");
     println!("[WIFI] Connecting...");
 
     // Connect async (non-blocking)
     match wifi_controller.connect_async().await {
-        Ok(()) => println!("[WIFI] Connected!"),
+        Ok(info) => println!("[WIFI] Connected to {info:?}!"),
         Err(e) => println!("[WIFI] Connect failed: {:?}", e),
     }
 
     // === Network Stack (DHCP) ===
     println!("[WIFI] Setting up network stack...");
-    use embassy_net::{Config as NetConfig, StackResources, Runner};
+    use embassy_net::{Config as NetConfig, StackResources};
     use static_cell::StaticCell;
-use embassy_time::with_timeout;
 
     let net_config = NetConfig::dhcpv4(Default::default());
     static RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
     let resources = RESOURCES.init(StackResources::new());
 
-    let (stack, runner) = embassy_net::new(wifi_interfaces.sta, net_config, resources, 12345u64);
+    let (stack, runner) =
+        embassy_net::new(wifi_interfaces.station, net_config, resources, 12345u64);
 
     // Spawn network runner task
-    _spawner.spawn(net_task(runner)).ok();
+    _spawner.spawn(net_task(runner).unwrap());
 
     // Wait for DHCP IP
     println!("[WIFI] Waiting for DHCP...");
@@ -422,7 +460,10 @@ use embassy_time::with_timeout;
     // BLE init removed: btdm_controller_init panics (-4) when coexisting with WiFi
     // without coex config. We don't use BLE features yet anyway.
 
-    let mut boot_button = Input::new(peripherals.GPIO0, InputConfig::default().with_pull(Pull::Up));
+    let mut boot_button = Input::new(
+        peripherals.GPIO0,
+        InputConfig::default().with_pull(Pull::Up),
+    );
     println!("=== All systems GO! (Embassy async) ===");
 
     // === State ===
@@ -544,19 +585,24 @@ use embassy_time::with_timeout;
                 AppState::Watchface => match current_page {
                     // Clock page: 1 Hz when gyro is off (only seconds change),
                     // 33 ms when gyro is on (smooth ball animation).
-                    Page::Clock => if watchface.gyro_enabled {
-                        Duration::from_millis(33)
-                    } else {
-                        Duration::from_secs(1)
-                    },
+                    Page::Clock => {
+                        if watchface.gyro_enabled {
+                            Duration::from_millis(33)
+                        } else {
+                            Duration::from_secs(1)
+                        }
+                    }
                     Page::Sensors => Duration::from_millis(100), // 10 Hz IMU display
-                    Page::System  => Duration::from_secs(2),     // basically static
+                    Page::System => Duration::from_secs(2),      // basically static
                 },
-                AppState::Launcher | AppState::Settings | AppState::Mp3Player
+                AppState::Launcher
+                | AppState::Settings
+                | AppState::Mp3Player
                 | AppState::SmartHome => Duration::from_millis(100),
                 AppState::Flappy => Duration::from_millis(8),
-                AppState::Snake | AppState::Game2048 | AppState::Tetris
-                | AppState::Maze => Duration::from_millis(16),
+                AppState::Snake | AppState::Game2048 | AppState::Tetris | AppState::Maze => {
+                    Duration::from_millis(16)
+                }
             }
         };
 
@@ -570,7 +616,8 @@ use embassy_time::with_timeout;
             Timer::after(tick),
             touch_int.wait_for_falling_edge(),
             boot_button.wait_for_falling_edge(),
-        ).await;
+        )
+        .await;
 
         let now = Instant::now();
         let dt_ms = (now - last_frame).as_millis() as u32;
@@ -599,7 +646,11 @@ use embassy_time::with_timeout;
                 watchface.update_accel(a.x, a.y, a.z);
             }
             if let Ok(g) = imu.read_gyro() {
-                gyro_data = ((g.x * 10.0) as i16, (g.y * 10.0) as i16, (g.z * 10.0) as i16);
+                gyro_data = (
+                    (g.x * 10.0) as i16,
+                    (g.y * 10.0) as i16,
+                    (g.z * 10.0) as i16,
+                );
             }
             if let Ok(t) = imu.read_temperature() {
                 imu_temp = (t * 10.0) as i16;
@@ -646,97 +697,144 @@ use embassy_time::with_timeout;
         was_touching = int_low;
         if touch_active {
             if let Ok((point, event)) = touch.poll() {
-            // Swipe handling for page navigation (only in Watchface mode)
-            if app_state == AppState::Watchface {
-                if let Some(tp) = point {
-                    last_touch_x = tp.x;
-                    last_touch_y = tp.y;
-                    if !swiping {
-                        if swipe_start_x == 0 { swipe_start_x = tp.x as i32; }
-                        else {
-                            let dx = tp.x as i32 - swipe_start_x;
-                            if dx.unsigned_abs() > 30 {
-                                swiping = true;
-                                swipe_dir = if dx < 0 { -1 } else { 1 };
-                                snap_current.copy_from_slice(fb.buffer());
-                                let target = if swipe_dir < 0 { current_page.next() } else { current_page.prev() };
-                                fb.clear_color(target.color());
-                                match target {
-                                    Page::Clock => {
-                                        let mut wf2 = WatchFace::new();
-                                        if let Ok(dt) = rtc.get_time() { wf2.update_time(dt.hours, dt.minutes, dt.seconds); }
-                                        wf2.update_battery(batt_pct, batt_mv, charging);
-                                        wf2.force_redraw();
-                                        let _ = wf2.render(&mut fb);
-                                    }
-                                    Page::Sensors => { let _ = pages::draw_sensors_page(&mut fb, 0,0,0,0,0,0,0); }
-                                    Page::System => { let _ = pages::draw_system_page(&mut fb, batt_mv, batt_pct, charging); }
-                                }
-                                snap_target.copy_from_slice(fb.buffer());
-                            }
-                        }
-                    }
-                    if swiping {
-                        let delta = (tp.x as i32 - swipe_start_x).clamp(-(board::LCD_WIDTH as i32), board::LCD_WIDTH as i32);
-                        let offset = ((delta * swipe_dir).clamp(0, board::LCD_WIDTH as i32) as usize) & !1;
-                        let w = board::LCD_WIDTH as usize;
-                        let h = board::LCD_HEIGHT as usize;
-                        if offset > 0 && offset < w {
-                            if swipe_dir < 0 {
-                                display.set_addr_window(0, 0, (w-offset) as u16, h as u16);
-                                display.bus_mut().begin_pixels();
-                                for row in 0..h { display.bus_mut().stream_pixels(&snap_current[row*w+offset..row*w+w]); }
-                                display.bus_mut().end_pixels();
-                                display.set_addr_window((w-offset) as u16, 0, offset as u16, h as u16);
-                                display.bus_mut().begin_pixels();
-                                for row in 0..h { display.bus_mut().stream_pixels(&snap_target[row*w..row*w+offset]); }
-                                display.bus_mut().end_pixels();
+                // Swipe handling for page navigation (only in Watchface mode)
+                if app_state == AppState::Watchface {
+                    if let Some(tp) = point {
+                        last_touch_x = tp.x;
+                        last_touch_y = tp.y;
+                        if !swiping {
+                            if swipe_start_x == 0 {
+                                swipe_start_x = tp.x as i32;
                             } else {
-                                display.set_addr_window(0, 0, offset as u16, h as u16);
-                                display.bus_mut().begin_pixels();
-                                for row in 0..h { display.bus_mut().stream_pixels(&snap_target[row*w+w-offset..row*w+w]); }
-                                display.bus_mut().end_pixels();
-                                display.set_addr_window(offset as u16, 0, (w-offset) as u16, h as u16);
-                                display.bus_mut().begin_pixels();
-                                for row in 0..h { display.bus_mut().stream_pixels(&snap_current[row*w..row*w+w-offset]); }
-                                display.bus_mut().end_pixels();
+                                let dx = tp.x as i32 - swipe_start_x;
+                                if dx.unsigned_abs() > 30 {
+                                    swiping = true;
+                                    swipe_dir = if dx < 0 { -1 } else { 1 };
+                                    snap_current.copy_from_slice(fb.buffer());
+                                    let target = if swipe_dir < 0 {
+                                        current_page.next()
+                                    } else {
+                                        current_page.prev()
+                                    };
+                                    fb.clear_color(target.color());
+                                    match target {
+                                        Page::Clock => {
+                                            let mut wf2 = WatchFace::new();
+                                            if let Ok(dt) = rtc.get_time() {
+                                                wf2.update_time(dt.hours, dt.minutes, dt.seconds);
+                                            }
+                                            wf2.update_battery(batt_pct, batt_mv, charging);
+                                            wf2.force_redraw();
+                                            let _ = wf2.render(&mut fb);
+                                        }
+                                        Page::Sensors => {
+                                            let _ = pages::draw_sensors_page(
+                                                &mut fb, 0, 0, 0, 0, 0, 0, 0,
+                                            );
+                                        }
+                                        Page::System => {
+                                            let _ = pages::draw_system_page(
+                                                &mut fb, batt_mv, batt_pct, charging,
+                                            );
+                                        }
+                                    }
+                                    snap_target.copy_from_slice(fb.buffer());
+                                }
+                            }
+                        }
+                        if swiping {
+                            let delta = (tp.x as i32 - swipe_start_x)
+                                .clamp(-(board::LCD_WIDTH as i32), board::LCD_WIDTH as i32);
+                            let offset = ((delta * swipe_dir).clamp(0, board::LCD_WIDTH as i32)
+                                as usize)
+                                & !1;
+                            let w = board::LCD_WIDTH as usize;
+                            let h = board::LCD_HEIGHT as usize;
+                            if offset > 0 && offset < w {
+                                if swipe_dir < 0 {
+                                    display.set_addr_window(0, 0, (w - offset) as u16, h as u16);
+                                    display.bus_mut().begin_pixels();
+                                    for row in 0..h {
+                                        display.bus_mut().stream_pixels(
+                                            &snap_current[row * w + offset..row * w + w],
+                                        );
+                                    }
+                                    display.bus_mut().end_pixels();
+                                    display.set_addr_window(
+                                        (w - offset) as u16,
+                                        0,
+                                        offset as u16,
+                                        h as u16,
+                                    );
+                                    display.bus_mut().begin_pixels();
+                                    for row in 0..h {
+                                        display
+                                            .bus_mut()
+                                            .stream_pixels(&snap_target[row * w..row * w + offset]);
+                                    }
+                                    display.bus_mut().end_pixels();
+                                } else {
+                                    display.set_addr_window(0, 0, offset as u16, h as u16);
+                                    display.bus_mut().begin_pixels();
+                                    for row in 0..h {
+                                        display.bus_mut().stream_pixels(
+                                            &snap_target[row * w + w - offset..row * w + w],
+                                        );
+                                    }
+                                    display.bus_mut().end_pixels();
+                                    display.set_addr_window(
+                                        offset as u16,
+                                        0,
+                                        (w - offset) as u16,
+                                        h as u16,
+                                    );
+                                    display.bus_mut().begin_pixels();
+                                    for row in 0..h {
+                                        display.bus_mut().stream_pixels(
+                                            &snap_current[row * w..row * w + w - offset],
+                                        );
+                                    }
+                                    display.bus_mut().end_pixels();
+                                }
                             }
                         }
                     }
-                }
-                if let Some(swipe) = event {
-                    swipe_start_x = 0;
-                    if swiping {
-                        swiping = false;
-                        let ok = matches!(
-                            (&swipe.direction, swipe_dir),
-                            (SwipeDirection::Left, -1) | (SwipeDirection::Right, 1)
-                        );
-                        if ok {
-                            if swipe_dir < 0 { current_page = current_page.next(); }
-                            else { current_page = current_page.prev(); }
-                            fb.buffer_mut().copy_from_slice(&snap_target);
-                            page_dirty = true;
+                    if let Some(swipe) = event {
+                        swipe_start_x = 0;
+                        if swiping {
+                            swiping = false;
+                            let ok = matches!(
+                                (&swipe.direction, swipe_dir),
+                                (SwipeDirection::Left, -1) | (SwipeDirection::Right, 1)
+                            );
+                            if ok {
+                                if swipe_dir < 0 {
+                                    current_page = current_page.next();
+                                } else {
+                                    current_page = current_page.prev();
+                                }
+                                fb.buffer_mut().copy_from_slice(&snap_target);
+                                page_dirty = true;
+                            } else {
+                                fb.buffer_mut().copy_from_slice(&snap_current);
+                                fb.flush(&mut display);
+                            }
                         } else {
-                            fb.buffer_mut().copy_from_slice(&snap_current);
-                            fb.flush(&mut display);
+                            swipe_event = Some(swipe.direction);
+                            tap_event = swipe.direction == SwipeDirection::Tap;
                         }
-                    } else {
+                    }
+                } else {
+                    // In app mode: track position + forward events
+                    if let Some(tp) = point {
+                        last_touch_x = tp.x;
+                        last_touch_y = tp.y;
+                    }
+                    if let Some(swipe) = event {
                         swipe_event = Some(swipe.direction);
                         tap_event = swipe.direction == SwipeDirection::Tap;
                     }
                 }
-            } else {
-                // In app mode: track position + forward events
-                if let Some(tp) = point {
-                    last_touch_x = tp.x;
-                    last_touch_y = tp.y;
-                }
-                if let Some(swipe) = event {
-                    swipe_event = Some(swipe.direction);
-                    tap_event = swipe.direction == SwipeDirection::Tap;
-                }
-            }
             }
         }
 
@@ -795,8 +893,7 @@ use embassy_time::with_timeout;
         // The 2.4 GHz radio is the single biggest constant drain on the watch.
         // After 5 minutes of inactivity, drop the connection. The user can wake
         // the screen and we'll reconnect on next interaction (handled below).
-        if wifi_connected && idle_secs >= 300
-            && (now - last_wifi_idle_check).as_secs() >= 60 {
+        if wifi_connected && idle_secs >= 300 && (now - last_wifi_idle_check).as_secs() >= 60 {
             last_wifi_idle_check = now;
             if wifi_controller.disconnect_async().await.is_ok() {
                 println!("[WIFI] Disconnected (idle >5min, saving power)");
@@ -848,8 +945,13 @@ use embassy_time::with_timeout;
                     if page_dirty {
                         fb.clear_color(current_page.color());
                         match current_page {
-                            Page::Clock => { watchface.force_redraw(); }
-                            Page::System => { let _ = pages::draw_system_page(&mut fb, batt_mv, batt_pct, charging); }
+                            Page::Clock => {
+                                watchface.force_redraw();
+                            }
+                            Page::System => {
+                                let _ =
+                                    pages::draw_system_page(&mut fb, batt_mv, batt_pct, charging);
+                            }
                             _ => {}
                         }
                         page_dirty = false;
@@ -869,7 +971,16 @@ use embassy_time::with_timeout;
                             let ay = (accel.1 * 100.0) as i16;
                             let az = (accel.2 * 100.0) as i16;
                             fb.clear_color(current_page.color());
-                            let _ = pages::draw_sensors_page(&mut fb, ax, ay, az, gyro_data.0, gyro_data.1, gyro_data.2, imu_temp);
+                            let _ = pages::draw_sensors_page(
+                                &mut fb,
+                                ax,
+                                ay,
+                                az,
+                                gyro_data.0,
+                                gyro_data.1,
+                                gyro_data.2,
+                                imu_temp,
+                            );
                             need_flush = true;
                         }
                         Page::System => {} // Static, already rendered
@@ -950,20 +1061,29 @@ use embassy_time::with_timeout;
             AppState::Launcher => {
                 // Track touch Y for tap detection
                 if let Ok((point, _)) = touch.poll() {
-                    if let Some(tp) = point { last_touch_y = tp.y; }
+                    if let Some(tp) = point {
+                        last_touch_y = tp.y;
+                    }
                 }
                 if let Some(new_state) = launcher.update(swipe_event, tap_event, last_touch_y) {
                     app_state = new_state;
                     match app_state {
                         AppState::Snake => snake_game.setup(),
-                        AppState::Game2048 => { game_2048.setup(); game_2048.render(&mut fb); fb.flush(&mut display); }
+                        AppState::Game2048 => {
+                            game_2048.setup();
+                            game_2048.render(&mut fb);
+                            fb.flush(&mut display);
+                        }
                         AppState::Tetris => tetris_game.setup(),
                         AppState::Flappy => flappy_game.setup(),
                         AppState::Maze => maze_game.setup(),
                         AppState::Mp3Player => mp3_player.setup(),
                         AppState::SmartHome => smarthome_app.setup(),
                         AppState::Settings => {}
-                        AppState::Watchface => { watchface.force_redraw(); page_dirty = true; }
+                        AppState::Watchface => {
+                            watchface.force_redraw();
+                            page_dirty = true;
+                        }
                         _ => {}
                     }
                 } else {
@@ -979,31 +1099,63 @@ use embassy_time::with_timeout;
             }
 
             AppState::Game2048 => {
-                let input = AppInput { touch: None, swipe: swipe_event, tap: tap_event, accel, dt_ms: dt_ms.max(1) };
+                let input = AppInput {
+                    touch: None,
+                    swipe: swipe_event,
+                    tap: tap_event,
+                    accel,
+                    dt_ms: dt_ms.max(1),
+                };
                 game_2048.update(&input);
                 // Only render on input (swipe moves tiles)
                 if swipe_event.is_some() {
                     game_2048.render(&mut fb);
                     fb.flush_vsync(&mut display, &te_pin);
                 }
-                if boot_button.is_low() { app_state = AppState::Launcher; Timer::after(Duration::from_millis(200)).await; }
+                if boot_button.is_low() {
+                    app_state = AppState::Launcher;
+                    Timer::after(Duration::from_millis(200)).await;
+                }
             }
 
             AppState::Tetris => {
-                let input = AppInput { touch: None, swipe: swipe_event, tap: tap_event, accel, dt_ms: dt_ms.max(1) };
+                let input = AppInput {
+                    touch: None,
+                    swipe: swipe_event,
+                    tap: tap_event,
+                    accel,
+                    dt_ms: dt_ms.max(1),
+                };
                 tetris_game.update(&input);
                 if tetris_game.stepped() || swipe_event.is_some() || tap_event {
                     tetris_game.render(&mut fb);
                     fb.flush_vsync(&mut display, &te_pin);
                 }
-                if boot_button.is_low() { app_state = AppState::Launcher; Timer::after(Duration::from_millis(200)).await; }
+                if boot_button.is_low() {
+                    app_state = AppState::Launcher;
+                    Timer::after(Duration::from_millis(200)).await;
+                }
             }
 
             AppState::Flappy => {
                 // Touch via GPIO38 (instant)
                 let touch_down = touch_int.is_low();
-                let fake_touch = if touch_down { Some(crate::peripherals::touch::TouchPoint { x: 200, y: 250, fingers: 1 }) } else { None };
-                let input = AppInput { touch: fake_touch, swipe: swipe_event, tap: tap_event, accel, dt_ms: dt_ms.max(1) };
+                let fake_touch = if touch_down {
+                    Some(crate::peripherals::touch::TouchPoint {
+                        x: 200,
+                        y: 250,
+                        fingers: 1,
+                    })
+                } else {
+                    None
+                };
+                let input = AppInput {
+                    touch: fake_touch,
+                    swipe: swipe_event,
+                    tap: tap_event,
+                    accel,
+                    dt_ms: dt_ms.max(1),
+                };
                 flappy_game.update(&input);
                 // Double-buffered render: draw to fb, swap+flush with VSync
                 flappy_game.render(&mut fb);
@@ -1019,7 +1171,13 @@ use embassy_time::with_timeout;
             }
 
             AppState::Maze => {
-                let input = AppInput { touch: None, swipe: swipe_event, tap: tap_event, accel, dt_ms: dt_ms.max(1) };
+                let input = AppInput {
+                    touch: None,
+                    swipe: swipe_event,
+                    tap: tap_event,
+                    accel,
+                    dt_ms: dt_ms.max(1),
+                };
                 maze_game.update(&input);
                 // Maze renders at 30fps (IMU continuous)
                 if now >= next_watchface_flush {
@@ -1027,11 +1185,20 @@ use embassy_time::with_timeout;
                     fb.flush_vsync(&mut display, &te_pin);
                     next_watchface_flush = now + Duration::from_millis(33);
                 }
-                if boot_button.is_low() { app_state = AppState::Launcher; Timer::after(Duration::from_millis(200)).await; }
+                if boot_button.is_low() {
+                    app_state = AppState::Launcher;
+                    Timer::after(Duration::from_millis(200)).await;
+                }
             }
 
             AppState::SmartHome => {
-                let input = AppInput { touch: None, swipe: swipe_event, tap: tap_event, accel, dt_ms: dt_ms.max(1) };
+                let input = AppInput {
+                    touch: None,
+                    swipe: swipe_event,
+                    tap: tap_event,
+                    accel,
+                    dt_ms: dt_ms.max(1),
+                };
                 smarthome_app.update(&input);
                 // TODO: when get_pending_request() returns a URL, send HTTP request via embassy-net
                 // For now just show the UI
@@ -1040,18 +1207,30 @@ use embassy_time::with_timeout;
                     fb.flush_vsync(&mut display, &te_pin);
                     next_watchface_flush = now + Duration::from_millis(100);
                 }
-                if boot_button.is_low() { app_state = AppState::Launcher; Timer::after(Duration::from_millis(200)).await; }
+                if boot_button.is_low() {
+                    app_state = AppState::Launcher;
+                    Timer::after(Duration::from_millis(200)).await;
+                }
             }
 
             AppState::Mp3Player => {
-                let input = AppInput { touch: None, swipe: swipe_event, tap: tap_event, accel, dt_ms: dt_ms.max(1) };
+                let input = AppInput {
+                    touch: None,
+                    swipe: swipe_event,
+                    tap: tap_event,
+                    accel,
+                    dt_ms: dt_ms.max(1),
+                };
                 mp3_player.update(&input);
                 mp3_player.render(&mut fb);
                 if now >= next_watchface_flush {
                     fb.flush_vsync(&mut display, &te_pin);
                     next_watchface_flush = now + Duration::from_millis(200);
                 }
-                if boot_button.is_low() { app_state = AppState::Launcher; Timer::after(Duration::from_millis(200)).await; }
+                if boot_button.is_low() {
+                    app_state = AppState::Launcher;
+                    Timer::after(Duration::from_millis(200)).await;
+                }
             }
 
             AppState::Settings => {

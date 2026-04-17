@@ -6,16 +6,16 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 # ESP HAL + Runtime
-esp-hal = { version = "1.0.0", default-features = true, features = ["esp32s3", "unstable", "psram"] }
-esp-rtos = { version = "0.2.0", features = ["esp32s3", "embassy", "esp-radio"] }
-esp-alloc = "0.9.0"
-esp-println = { version = "0.16.1", features = ["esp32s3", "log-04"] }
-esp-backtrace = { version = "0.18.1", features = ["esp32s3", "panic-handler", "println"] }
-esp-bootloader-esp-idf = { version = "0.4", features = ["esp32s3"] }
+esp-hal = { version = "1.1.0-rc.0", default-features = true, features = ["esp32s3", "unstable"] }
+esp-rtos = { version = "0.3.0", features = ["esp32s3", "embassy", "esp-radio"] }
+esp-alloc = "0.10.0"
+esp-println = { version = "0.17.0", features = ["esp32s3", "log-04"] }
+esp-backtrace = { version = "0.19.0", features = ["esp32s3", "panic-handler", "println"] }
+esp-bootloader-esp-idf = { version = "0.5", features = ["esp32s3"] }
 log = "0.4"
 
 # Embassy async runtime
-embassy-executor = "0.9.0"
+embassy-executor = "0.10.0"
 embassy-time = "0.5.1"
 embassy-sync = "0.8"
 embassy-futures = "0.1"
@@ -30,13 +30,13 @@ embedded-hal = "1.0"
 embedded-hal-bus = "0.3"
 
 # WiFi / Networking
-esp-radio = { version = "0.17.0", features = ["esp32s3", "wifi", "unstable", "log-04"] }
-embassy-net = { version = "0.9.0", features = ["dhcpv4", "medium-ethernet", "tcp", "udp", "dns"] }
+esp-radio = { version = "0.18.0", features = ["esp32s3", "wifi", "unstable", "log-04"] }
+embassy-net = { version = "0.9.1", features = ["dhcpv4", "medium-ethernet", "tcp", "udp", "dns"] }
 
 # Peripheral drivers
 axp2101-embedded = "0.3"
-embedded-sdmmc = "0.8"
-embedded-io-async = "0.6"
+embedded-sdmmc = "0.9"
+embedded-io-async = "0.7"
 
 # MP3 decoding
 nanomp3 = "0.1"
@@ -47,3 +47,4 @@ opt-level = "s"
 [profile.release]
 opt-level = "s"
 lto = true
+strip = true
